@@ -3,18 +3,24 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fused-triton-rmsnorm-residual-qkv"
+name = "triton-fused-rmsnorm-qkv"
 version = "0.1.0"
-description = "Triton-backed residual RMSNorm with packed QKV projection"
+description = "Fused RMSNorm + residual + QKV projection Triton kernel with rigorous benchmarks"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "torch>=2.3",
+    "torch>=2.4",
+    "triton>=3.0",
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "matplotlib>=3.8",
+    "transformers>=4.40",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=8.0",
+    "pytest>=8.0",
+    "pytest-xdist>=3.5",
 ]
 
 [tool.setuptools]
@@ -22,3 +28,7 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

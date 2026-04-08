@@ -1,56 +1,78 @@
-# fused-triton-rmsnorm-residual-qkv
+# Fused RMSNorm + Residual + QKV Projection — Triton Kernel
 
-A fresh implementation workspace for a fused RMSNorm + residual + QKV path using Triton.
+Production-grade Triton kernel that fuses the residual add, RMSNorm, and
+packed QKV projection into a single GPU launch — targeting the critical path
+in decoder-only transformer inference (Llama-3-8B, Mistral-7B, Qwen2-7B).
 
-## Current status
+**Target hardware:** AWS g5.2xlarge (NVIDIA A10G, 24 GB VRAM, 600 GB/s HBM).
 
-This repo contains the first working cut:
+## Why this matters
 
-- Triton forward kernel for `residual + RMSNorm`
-- PyTorch wrapper for fused `QKV` projection after normalization
-- Reference implementation for correctness checks
-- Unit tests against the reference path
-- A small benchmark harness
+In standard transformer inference the sequence
+`residual_add → RMSNorm → QKV_linear` issues three separate CUDA kernels,
+each paying a full round-trip to HBM. Fusing them into one Triton program
+eliminates two kernel-launch overheads and two redundant global memory passes,
+which matters most at small-to-medium batch sizes where the workload is
+memory-bandwidth-bound.
 
-## Scope of this first milestone
+## Project roadmap
 
-The forward path currently fuses:
+| Week | Milestone | Status |
+|------|-----------|--------|
+| 1 | PyTorch baseline + benchmark harness | **current** |
+| 2 | Fused Triton kernel (forward) | planned |
+| 3 | Autotuning + roofline analysis | planned |
+| 4 | Backward pass + end-to-end integration | planned |
 
-1. residual add
-2. RMSNorm statistics + scaling
-3. a single packed QKV linear projection in PyTorch
+## Repository layout
 
-That means the normalization step is Triton-backed now, while the packed projection is still routed through `torch.nn.functional.linear`.
-
-## Why this layout
-
-It gives us a clean, testable baseline before attempting the gnarlier version where RMSNorm and the packed QKV projection are fused deeper into a single Triton program or launch pipeline.
-
-## Project layout
-
-- `src/fused_triton_rmsnorm_residual_qkv/ops.py` - kernels and wrappers
-- `tests/test_reference.py` - correctness checks
-- `benchmarks/benchmark_forward.py` - quick perf harness
+```
+src/triton_fused_rmsnorm_qkv/
+    baseline.py          # unfused PyTorch reference
+    kernel.py            # (week 2) fused Triton kernel
+benchmarks/
+    harness.py           # torch.utils.benchmark-based harness
+    results/             # CSV outputs
+tests/
+    test_correctness.py  # parametrized correctness suite
+notebooks/               # exploration & analysis
+```
 
 ## Quick start
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -e .[dev]
-pytest -q
+# Install (requires uv)
+make install
+
+# Run correctness tests
+make test
+
+# Run benchmark grid
+make benchmark
 ```
 
-## Benchmark
+## Model configurations benchmarked
 
-```bash
-python benchmarks/benchmark_forward.py --batch 8 --seq 512 --hidden 4096
-```
+| Model | Hidden | Heads | Head dim |
+|-------|--------|-------|----------|
+| Llama-3-8B | 4096 | 32 | 128 |
+| Mistral-7B | 4096 | 32 | 128 |
+| Qwen2-7B | 3584 | 28 | 128 |
 
-## Next steps
+Shape grid: batch in {1, 4, 16}, seqlen in {128, 512, 2048}.
 
-- add backward support
-- benchmark against PyTorch-native kernels
-- decide whether to fuse the packed QKV projection fully in Triton
-- add support for tensor-parallel / grouped projection layouts if the project spec needs them
+## Benchmark methodology
+
+- **Timer:** `torch.utils.benchmark.Timer` (not `time.time`)
+- **Sync:** explicit `torch.cuda.synchronize()` barriers
+- **Warmup:** 10 iterations discarded
+- **Measurement:** `blocked_autorange` with min 0.5 s run time
+- **Output:** pandas DataFrame → `benchmarks/results/baseline.csv`
+
+## Results
+
+*(to be populated after running on A10G)*
+
+## License
+
+MIT

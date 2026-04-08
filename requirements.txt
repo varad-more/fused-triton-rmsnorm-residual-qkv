@@ -1,0 +1,8 @@
+torch>=2.4
+triton>=3.0
+numpy>=1.26
+pandas>=2.1
+matplotlib>=3.8
+transformers>=4.40
+pytest>=8.0
+pytest-xdist>=3.5
