@@ -1,18 +1,26 @@
 """Fused Triton kernel: residual add + RMSNorm + packed QKV projection.
 
 Single GPU launch that eliminates two HBM round-trips compared to the
-unfused PyTorch baseline. Each program instance processes one row (one token)
-of the (B*S, H) input.
+unfused PyTorch baseline. Each program instance handles a (BLOCK_M × BLOCK_N)
+output tile and uses tl.dot (tensor cores) for the QKV projection.
+
+Grid: (ceil(M / BLOCK_M), ceil(3*H / BLOCK_N))
 
 Strategy:
-  - BLOCK_H is the next power-of-2 >= H, so the full hidden dim fits in
-    one register tile.
-  - Phase 1: Load x and residual, compute hidden = x + residual, RMSNorm
-    in fp32 (variance, rsqrt, gain), keep normed vector in registers.
-  - Phase 2: For each of the 3 output chunks (Q, K, V), tile over output
-    columns in groups of BLOCK_H. For each tile, do a 2D weight load
-    (BLOCK_H output cols × BLOCK_H inner dim), broadcast-multiply with
-    the normed vector, reduce, and store.
+  - Phase 1: Each program loads its (BLOCK_M, H) slice of hidden = x + r in
+    BLOCK_K-column chunks, accumulates sum-of-squares, computes rstd per row.
+  - Phase 2: Re-reads the same hidden slice (expected L1-resident for small
+    BLOCK_M) per K-tile, applies RMSNorm gain, then tl.dot with the
+    (BLOCK_K, BLOCK_N) weight tile to accumulate into the output.
+
+HBM traffic analysis (per SM):
+  - x, r:      2 × BLOCK_M × H  (read twice; stays in L1 between passes)
+  - W:         BLOCK_N × H  (each program reads a unique row-stripe of W)
+  - rms_weight: H per program (read once per K-tile, BLOCK_K elems at a time)
+  - output:    BLOCK_M × BLOCK_N (written once)
+
+Aggregated, W is read once total (different programs read disjoint row-stripes),
+and x/r re-reads are L1-cache hits for BLOCK_M × H ≤ L1 capacity (~128 KB).
 
 This avoids materializing the intermediate normalized tensor to HBM.
 """
@@ -24,6 +32,13 @@ from typing import Tuple
 import torch
 import triton
 import triton.language as tl
+
+# Tile sizes — chosen so BLOCK_M*BLOCK_K*2 bytes ≤ L1 (128 KB on A10G):
+#   16 × 64 × 2 = 2 KB (fp16) — plenty of headroom for double-buffering.
+# BLOCK_M and BLOCK_N must be multiples of 16 for tensor-core alignment.
+_BLOCK_M = 16
+_BLOCK_N = 128
+_BLOCK_K = 64
 
 
 @triton.jit
@@ -40,53 +55,85 @@ def _fused_rmsnorm_residual_qkv_kernel(
     stride_w_row,
     stride_o_row,
     eps,
-    BLOCK_H: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    IS_BF16: tl.constexpr,   # True → bfloat16 output, False → float16
 ):
-    row_idx = tl.program_id(0)
-    col_offs = tl.arange(0, BLOCK_H)
-    mask = col_offs < H
+    pid_m = tl.program_id(0)   # row tile
+    pid_n = tl.program_id(1)   # output-column tile
 
-    # -- Phase 1: residual add + RMSNorm --
-    x = tl.load(X_ptr + row_idx * stride_x_row + col_offs, mask=mask, other=0.0)
-    r = tl.load(Residual_ptr + row_idx * stride_r_row + col_offs, mask=mask, other=0.0)
-    hidden = x + r
+    m_start = pid_m * BLOCK_M
+    n_start = pid_n * BLOCK_N
 
-    hidden_f32 = hidden.to(tl.float32)
-    var = tl.sum(hidden_f32 * hidden_f32, axis=0) / H
-    rstd = 1.0 / tl.sqrt(var + eps)
+    m_offs = m_start + tl.arange(0, BLOCK_M)   # (BLOCK_M,)
+    n_offs = n_start + tl.arange(0, BLOCK_N)   # (BLOCK_N,)
+    m_mask = m_offs < M
+    n_mask = n_offs < 3 * H
 
-    w = tl.load(RMSWeight_ptr + col_offs, mask=mask, other=0.0)
-    normed = (hidden_f32 * rstd * w.to(tl.float32)).to(x.dtype)  # (BLOCK_H,)
+    # ── Phase 1: residual add + RMSNorm (compute rstd) ──────────────────────
+    # Load hidden = x + r in BLOCK_K columns at a time, accumulate variance.
+    var = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for k_start in range(0, H, BLOCK_K):
+        k_offs = k_start + tl.arange(0, BLOCK_K)   # (BLOCK_K,)
+        k_mask = k_offs < H
 
-    # -- Phase 2: QKV projection --
-    # normed is fully in registers (BLOCK_H >= H).
-    # Output = normed @ QKVWeight^T, split into 3 chunks of H.
-    for c in tl.static_range(3):
-        base_row = c * H
-        for j_start in range(0, H, BLOCK_H):
-            j_offs = tl.arange(0, BLOCK_H) + j_start
-            j_mask = j_offs < H
+        x_tile = tl.load(
+            X_ptr + m_offs[:, None] * stride_x_row + k_offs[None, :],
+            mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+        )  # (BLOCK_M, BLOCK_K)
+        r_tile = tl.load(
+            Residual_ptr + m_offs[:, None] * stride_r_row + k_offs[None, :],
+            mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+        )  # (BLOCK_M, BLOCK_K)
 
-            acc = tl.zeros([BLOCK_H], dtype=tl.float32)
-            for k_start in range(0, H, BLOCK_H):
-                k_offs = tl.arange(0, BLOCK_H) + k_start
-                k_mask = k_offs < H
+        h_tile_f32 = (x_tile + r_tile).to(tl.float32)  # (BLOCK_M, BLOCK_K)
+        var += tl.sum(h_tile_f32 * h_tile_f32, axis=1)   # (BLOCK_M,)
 
-                # 2D load: weight_tile[j, k] = QKVWeight[base_row + j_offs[j], k_offs[k]]
-                w_ptrs = (QKVWeight_ptr
-                          + (base_row + j_offs[:, None]) * stride_w_row
-                          + k_offs[None, :])
-                w_tile = tl.load(w_ptrs, mask=j_mask[:, None] & k_mask[None, :], other=0.0)
+    rstd = 1.0 / tl.sqrt(var / H + eps)   # (BLOCK_M,) fp32
 
-                n_tile = tl.where(k_mask, normed, 0.0)
-                acc += tl.sum(w_tile * n_tile[None, :], axis=1)
+    # ── Phase 2: QKV projection using tl.dot ────────────────────────────────
+    # For each K-tile:
+    #   normed[m, k] = hidden[m, k] * rstd[m] * rms_weight[k]
+    #   acc[m, n]   += normed[m, :] @ W[n, :]^T
+    # W is (3*H, H) row-major; we load W^T tile as (BLOCK_K, BLOCK_N).
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-            out_col = base_row + j_offs
-            tl.store(
-                Out_ptr + row_idx * stride_o_row + out_col,
-                acc.to(x.dtype),
-                mask=j_mask,
-            )
+    for k_start in range(0, H, BLOCK_K):
+        k_offs = k_start + tl.arange(0, BLOCK_K)
+        k_mask = k_offs < H
+
+        # Re-read hidden (BLOCK_M × BLOCK_K ≤ L1, so these are cache hits).
+        x_tile = tl.load(
+            X_ptr + m_offs[:, None] * stride_x_row + k_offs[None, :],
+            mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+        )
+        r_tile = tl.load(
+            Residual_ptr + m_offs[:, None] * stride_r_row + k_offs[None, :],
+            mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+        )
+        h_tile_f32 = (x_tile + r_tile).to(tl.float32)
+
+        w_rms = tl.load(RMSWeight_ptr + k_offs, mask=k_mask, other=0.0).to(tl.float32)
+        # normed in original dtype for tensor-core compatibility
+        normed_tile = (h_tile_f32 * rstd[:, None] * w_rms[None, :]).to(x_tile.dtype)
+        # (BLOCK_M, BLOCK_K) in fp16/bf16
+
+        # Weight tile W^T: shape (BLOCK_K, BLOCK_N)
+        # W[n, k] lives at QKVWeight_ptr + n*stride_w_row + k
+        # We want w_t[k_idx, n_idx] = W[n_offs[n_idx], k_offs[k_idx]]
+        w_t = tl.load(
+            QKVWeight_ptr + n_offs[None, :] * stride_w_row + k_offs[:, None],
+            mask=k_mask[:, None] & n_mask[None, :], other=0.0,
+        )  # (BLOCK_K, BLOCK_N) in fp16/bf16
+
+        # Tensor-core matmul: (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N) → fp32 acc
+        acc = tl.dot(normed_tile, w_t, acc, out_dtype=tl.float32)
+
+    # ── Store output ─────────────────────────────────────────────────────────
+    out_cast = tl.bfloat16 if IS_BF16 else tl.float16
+    out_ptrs = Out_ptr + m_offs[:, None] * stride_o_row + n_offs[None, :]
+    tl.store(out_ptrs, acc.to(out_cast), mask=m_mask[:, None] & n_mask[None, :])
 
 
 def fused_rmsnorm_residual_qkv(
@@ -108,8 +155,7 @@ def fused_rmsnorm_residual_qkv(
     r_flat = residual.reshape(M, H)
     out = torch.empty(M, 3 * H, dtype=x.dtype, device=x.device)
 
-    BLOCK_H = triton.next_power_of_2(H)
-    grid = (M,)
+    grid = (triton.cdiv(M, _BLOCK_M), triton.cdiv(3 * H, _BLOCK_N))
 
     _fused_rmsnorm_residual_qkv_kernel[grid](
         x_flat, r_flat, rms_weight, qkv_weight, out,
@@ -119,7 +165,10 @@ def fused_rmsnorm_residual_qkv(
         qkv_weight.stride(0),
         out.stride(0),
         eps,
-        BLOCK_H=BLOCK_H,
+        BLOCK_M=_BLOCK_M,
+        BLOCK_N=_BLOCK_N,
+        BLOCK_K=_BLOCK_K,
+        IS_BF16=(x.dtype == torch.bfloat16),
     )
 
     out = out.reshape(B, S, 3 * H)
