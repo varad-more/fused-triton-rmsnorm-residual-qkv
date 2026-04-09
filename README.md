@@ -69,7 +69,23 @@ Shape grid: batch in {1, 4, 16}, seqlen in {128, 512, 2048}.
 - **Measurement:** `blocked_autorange` with min 0.5 s run time
 - **Output:** pandas DataFrame → `benchmarks/results/baseline.csv`
 
-## Results
+## Test results
+
+Correctness suite: **20/20 passed** (CPU, Python 3.12, PyTorch 2.11, Triton 3.6)
+
+```
+tests/test_correctness.py  20 passed in 61.46s
+
+  TestBaselineCorrectness
+    test_matches_manual_reference  8/8 passed  (fp16 + bf16 × 4 shapes)
+    test_output_shapes             8/8 passed
+    test_output_dtype_preserved    2/2 passed  (fp16 + bf16)
+  TestEdgeCases
+    test_zero_residual             1/1 passed
+    test_unit_weight               1/1 passed
+```
+
+## Benchmark results
 
 *(to be populated after running on A10G)*
 
