@@ -1,0 +1,13 @@
+[9301] python3.13@127.0.0.1
+  _fused_rmsnorm_residual_qkv_kernel (32, 192, 1)x(128, 1, 1), Device 0, CC 8.6, Invocations 1
+    Section: Command line profiler metrics
+    Metric Name                                       Metric Unit  Minimum        Maximum        Average       
+    ------------------------------------------------- ------------ -------------- -------------- --------------
+    dram__bytes.sum.per_second                        Gbyte/second 560.633200     560.633200     560.633200    
+    l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum      Gbyte        16.119227      16.119227      16.119227     
+    sm__warps_active.avg.pct_of_peak_sustained_active %            41.283105      41.283105      41.283105     
+    smsp__inst_executed.avg                           inst         2469120.000000 2469120.000000 2469120.000000
+
+Note: The shown averages are calculated as the arithmetic mean of the metric values after the evaluation of the metrics for each individual kernel launch.
+If aggregating across varying launch configurations (like shared memory, cache config settings), the arithmetic mean can be misleading and looking at the individual results is recommended instead.
+This output mode is backwards compatible to the per-kernel summary output of nvprof

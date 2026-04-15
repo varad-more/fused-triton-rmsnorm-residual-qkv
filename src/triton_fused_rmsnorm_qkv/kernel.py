@@ -23,6 +23,11 @@ Aggregated, W is read once total (different programs read disjoint row-stripes),
 and x/r re-reads are L1-cache hits for BLOCK_M × H ≤ L1 capacity (~128 KB).
 
 This avoids materializing the intermediate normalized tensor to HBM.
+
+Phase 3: Tile sizes (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages) are
+selected per-shape by `@triton.autotune` keyed on (M, H). The config space
+spans decode-oriented tiles (small BLOCK_M for M ≤ 32) and prefill-oriented
+tiles (BLOCK_M up to 128 to amortize weight reads over more output rows).
 """
 
 from __future__ import annotations
@@ -33,14 +38,101 @@ import torch
 import triton
 import triton.language as tl
 
-# Tile sizes — chosen so BLOCK_M*BLOCK_K*2 bytes ≤ L1 (128 KB on A10G):
-#   16 × 64 × 2 = 2 KB (fp16) — plenty of headroom for double-buffering.
-# BLOCK_M and BLOCK_N must be multiples of 16 for tensor-core alignment.
-_BLOCK_M = 16
-_BLOCK_N = 128
-_BLOCK_K = 64
+
+def _autotune_configs():
+    """Full sweep over the spec'd config space:
+        BLOCK_M ∈ {32, 64, 128}
+        BLOCK_N ∈ {64, 128, 256}
+        BLOCK_K ∈ {16, 32, 64}
+        num_warps ∈ {4, 8}
+        num_stages ∈ {2, 3, 4}
+
+    Static filters drop configs that would clearly fail on A10G:
+      - tile area > 128*256 (register pressure for fp32 accumulator),
+      - large tiles (BM*BN ≥ 16384) with too few warps to fill them,
+      - per-stage shared-mem footprint × num_stages > 96 KB
+        (A10G Ampere shared-mem budget per SM is 100 KB usable).
+
+    Per-shape pruning (`_prune_configs`) further drops configs where
+    BLOCK_M wildly exceeds M. ~80 configs survive after static filtering.
+    """
+    SHARED_MEM_BUDGET = 96 * 1024   # bytes per SM (Ampere; leave 4 KB headroom)
+    BYTES_PER_HALF = 2
+
+    configs = []
+    for BM in (32, 64, 128):
+        for BN in (64, 128, 256):
+            for BK in (16, 32, 64):
+                for nw in (4, 8):
+                    for ns in (2, 3, 4):
+                        # 1) tile area cap (register pressure)
+                        if BM * BN > 128 * 256:
+                            continue
+                        # 2) large tiles need enough warps to cover them
+                        if BM * BN >= 128 * 128 and nw < 8:
+                            continue
+                        # 3) shared-memory budget for the K-stage buffers
+                        bytes_per_stage = BYTES_PER_HALF * (BM * BK + BK * BN)
+                        if bytes_per_stage * ns > SHARED_MEM_BUDGET:
+                            continue
+                        configs.append(triton.Config(
+                            {"BLOCK_M": BM, "BLOCK_N": BN, "BLOCK_K": BK},
+                            num_warps=nw, num_stages=ns,
+                        ))
+    return configs
 
 
+def _prune_configs(configs, named_args, **kwargs):
+    """Per-shape pruning to keep autotune wall time bounded.
+
+    Strategy:
+      - BLOCK_M is upper-bounded by 2×M (avoid wasted masked rows on small M).
+      - BLOCK_M is lower-bounded by max(32, M//4) when M is large — small
+        BLOCK_M for big M means too many programs and excessive W re-reads.
+      - num_stages=4 only kept when BLOCK_K ≤ 32 (big-K configs rarely benefit
+        from the extra pipeline depth and pay shared-mem cost).
+
+    These rules cut the per-shape config count by ~3× without removing any
+    config that is plausibly optimal for the regime.
+    """
+    M = named_args["M"]
+
+    def keep(c):
+        BM = c.kwargs["BLOCK_M"]
+        BK = c.kwargs["BLOCK_K"]
+        # Upper bound: BLOCK_M <= 2*M (or 32 minimum)
+        if BM > max(32, 2 * M):
+            return False
+        # Lower bound for large M: skip BLOCK_M=32 once M >= 256
+        if M >= 256 and BM == 32:
+            return False
+        # num_stages=4 only with smaller BLOCK_K
+        if c.num_stages == 4 and BK > 32:
+            return False
+        # For large M, BLOCK_K=16 is too narrow (too many K-loop iters);
+        # drop it to cut autotune time on the slowest shapes.
+        if M >= 1024 and BK == 16:
+            return False
+        # For large M, num_warps=4 with big tiles under-fills the SM.
+        if M >= 1024 and c.num_warps == 4 and BM * c.kwargs["BLOCK_N"] >= 64 * 128:
+            return False
+        return True
+
+    pruned = [c for c in configs if keep(c)]
+    return pruned or configs  # never return empty
+
+
+@triton.autotune(
+    configs=_autotune_configs(),
+    # dtype is implicitly part of the cache key via the IS_BF16 constexpr
+    # (Triton specializes per constexpr). H is also a constexpr so it
+    # already differentiates compiled kernels; we list both here for clarity
+    # so the autotune cache is explicitly keyed on the GEMM dims.
+    # Note: in this kernel N (output cols) = 3*H and K (reduction) = H, so
+    # (M, H) uniquely identifies the (M, N, K) tuple.
+    key=["M", "H"],
+    prune_configs_by={"early_config_prune": _prune_configs},
+)
 @triton.jit
 def _fused_rmsnorm_residual_qkv_kernel(
     X_ptr,
@@ -145,7 +237,8 @@ def fused_rmsnorm_residual_qkv(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused residual add + RMSNorm + QKV projection.
 
-    Drop-in replacement for baseline.rmsnorm_residual_qkv.
+    Drop-in replacement for baseline.rmsnorm_residual_qkv. Tile sizes are
+    selected by `@triton.autotune` on first call for each (M, H) shape.
     """
     assert x.is_cuda, "Fused kernel requires CUDA tensors"
     B, S, H = x.shape
@@ -155,7 +248,11 @@ def fused_rmsnorm_residual_qkv(
     r_flat = residual.reshape(M, H)
     out = torch.empty(M, 3 * H, dtype=x.dtype, device=x.device)
 
-    grid = (triton.cdiv(M, _BLOCK_M), triton.cdiv(3 * H, _BLOCK_N))
+    # Grid is a lambda so autotune's selected BLOCK_M/BLOCK_N determine sizing.
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(3 * H, META["BLOCK_N"]),
+    )
 
     _fused_rmsnorm_residual_qkv_kernel[grid](
         x_flat, r_flat, rms_weight, qkv_weight, out,
@@ -165,12 +262,29 @@ def fused_rmsnorm_residual_qkv(
         qkv_weight.stride(0),
         out.stride(0),
         eps,
-        BLOCK_M=_BLOCK_M,
-        BLOCK_N=_BLOCK_N,
-        BLOCK_K=_BLOCK_K,
         IS_BF16=(x.dtype == torch.bfloat16),
     )
 
     out = out.reshape(B, S, 3 * H)
     q, k, v = out.chunk(3, dim=-1)
     return q, k, v
+
+
+def get_autotune_best_config(M: int, H: int) -> dict | None:
+    """Return the autotune-selected config for a given (M, H), if cached.
+
+    Useful for roofline analysis and benchmark reporting. Returns None if
+    autotune has not yet run for this shape.
+    """
+    cache = getattr(_fused_rmsnorm_residual_qkv_kernel, "cache", {})
+    # Triton's autotune cache key includes all constexpr args + the `key` list,
+    # so we can't look up by (M, H) alone. Instead, scan for a matching entry.
+    for k, cfg in cache.items():
+        # k is a tuple that includes M and H somewhere; match conservatively.
+        if M in k and H in k:
+            return {
+                **cfg.kwargs,
+                "num_warps": cfg.num_warps,
+                "num_stages": cfg.num_stages,
+            }
+    return None

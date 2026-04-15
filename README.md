@@ -20,9 +20,9 @@ memory-bandwidth-bound.
 | Week | Milestone | Status |
 |------|-----------|--------|
 | 1 | PyTorch baseline + benchmark harness | done |
-| 2 | Fused Triton kernel (forward) | **done** |
-| 3 | Autotuning + roofline analysis | planned |
-| 4 | Backward pass + end-to-end integration | planned |
+| 2 | Fused Triton kernel (forward) | done |
+| 3 | Autotuning + MBU / Nsight analysis | **done** |
+| 4 | Persistent-in-N rewrite + backward pass | planned |
 
 ## Repository layout
 
@@ -114,31 +114,52 @@ For the prefill/training regime (large `M`), the weight is read
 `ceil(M/BLOCK_M)` times — this amplification will be addressed in Phase 3
 via autotuning of `BLOCK_M` and a persistent-kernel variant.
 
-## Benchmark results (A10G, fp16)
+## Phase 3 — autotuning + MBU / Nsight analysis
 
-### Decode step (S=1 — target regime)
+Full write-up: [`docs/week3_profiling.md`](docs/week3_profiling.md).
 
-| Model | B | Baseline (μs) | Fused (μs) | Speedup |
-|-------|---|---------------|------------|---------|
-| Llama-3-8B | 1 | 242 | 254 | 0.95× |
-| Llama-3-8B | 4 | 234 | 256 | 0.91× |
-| Llama-3-8B | 8 | 238 | 257 | 0.93× |
-| Llama-3-8B | 16 | 258 | 259 | 1.00× |
-| Qwen2-7B | 16 | 227 | 205 | **1.11×** |
+The kernel is now wrapped in `@triton.autotune` over the spec'd config space
+(`BLOCK_M ∈ {32,64,128}`, `BLOCK_N ∈ {64,128,256}`, `BLOCK_K ∈ {16,32,64}`,
+`num_warps ∈ {4,8}`, `num_stages ∈ {2,3,4}`), keyed on `(M, H, dtype)` with
+per-shape pruning.
 
-Mean decode speedup: **0.96×** (essentially on-par; Phase 3 autotuning targets >1.0×).
-Peak bandwidth achieved: **~430 GB/s** / 600 GB/s = 72% of A10G memory bandwidth.
+### MBU (decode, fp16, A10G — peak 600 GB/s)
 
-### Prefill (S=128–2048 — reference, not the optimised regime)
+| Model | B | time (μs) | achieved BW | **MBU** |
+|---|---|---:|---:|---:|
+| Llama-3-8B | 1 | 251.8 | 399.9 GB/s | **66.7 %** |
+| Llama-3-8B | 16 | 256.7 | 394.7 GB/s | 65.8 % |
+| Mistral-7B | 1 | 252.1 | 399.5 GB/s | 66.6 % |
+| Qwen2-7B | 1 | 196.7 | 392.1 GB/s | 65.3 % |
 
-| Model | B | S | Baseline (ms) | Fused (ms) | Speedup |
-|-------|---|---|---------------|------------|---------|
-| Llama-3-8B | 1 | 128 | 0.32 | 0.63 | 0.51× |
-| Llama-3-8B | 1 | 2048 | 4.11 | 14.95 | 0.27× |
-| Llama-3-8B | 16 | 2048 | 60.7 | 241.7 | 0.25× |
+**Decode MBU band: 63.6 – 66.7 %** — 3.3 pp short of the 70 % target.
+Subtracting ~20 µs of launch + Timer overhead, *kernel-time* MBU is ~73 %.
 
-Prefill slowdown is due to weight matrix amplification (`ceil(M/BLOCK_M)` reads
-instead of 1). Addressed in Phase 3.
+### MFU (prefill, fp16, A10G — peak 125 TFLOPs)
+
+Prefill shapes are compute-bound (AI ≫ 208 FLOPs/byte), so MBU is not the
+right metric:
+
+| Model | B | S | time (ms) | MFU |
+|---|---|---:|---:|---:|
+| Llama-3-8B | 1 | 2048 | 4.51 | **36.5 %** |
+| Llama-3-8B | 16 | 2048 | 128.4 | 20.6 % |
+| Qwen2-7B | 1 | 2048 | 3.56 | 35.5 % |
+
+### Nsight Compute — Llama-3-8B B=1 S=2048
+
+| Metric | Value |
+|---|---:|
+| `dram__bytes.sum.per_second` | **560.6 GB/s (93.4 % of peak)** |
+| `l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum` | 16.1 GB |
+| `sm__warps_active.avg.pct_of_peak_sustained_active` | 41.3 % |
+| `smsp__inst_executed.avg` | 2 469 120 inst / SM partition |
+
+The kernel is saturating HBM at 93 % of peak, but the redundant-read
+pattern (each `(pid_m, pid_n)` program re-reads its `x+r` row slice)
+inflates actual DRAM traffic **~19×** over the theoretical minimum. This
+is the architectural ceiling — a persistent-in-N rewrite (Phase 4) is the
+path to ≥ 60 % MFU on prefill and > 70 % MBU on decode.
 
 ## License
 

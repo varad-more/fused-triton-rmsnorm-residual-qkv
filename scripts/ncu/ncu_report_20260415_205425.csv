@@ -1,0 +1,5 @@
+"ID","Process ID","Process Name","Host Name","Kernel Name","Context","Stream","Block Size","Grid Size","Device","CC","Section Name","Metric Name","Metric Unit","Metric Value"
+"0","9301","python3.13","127.0.0.1","_fused_rmsnorm_residual_qkv_kernel","1","7","(128, 1, 1)","(32, 192, 1)","0","8.6","Command line profiler metrics","dram__bytes.sum.per_second","Gbyte/second","560.63"
+"0","9301","python3.13","127.0.0.1","_fused_rmsnorm_residual_qkv_kernel","1","7","(128, 1, 1)","(32, 192, 1)","0","8.6","Command line profiler metrics","l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum","Gbyte","16.12"
+"0","9301","python3.13","127.0.0.1","_fused_rmsnorm_residual_qkv_kernel","1","7","(128, 1, 1)","(32, 192, 1)","0","8.6","Command line profiler metrics","sm__warps_active.avg.pct_of_peak_sustained_active","%","41.28"
+"0","9301","python3.13","127.0.0.1","_fused_rmsnorm_residual_qkv_kernel","1","7","(128, 1, 1)","(32, 192, 1)","0","8.6","Command line profiler metrics","smsp__inst_executed.avg","inst","2469120"
