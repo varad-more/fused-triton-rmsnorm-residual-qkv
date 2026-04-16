@@ -1,33 +1,38 @@
 """Fused Triton kernel: residual add + RMSNorm + packed QKV projection.
 
-Single GPU launch that eliminates two HBM round-trips compared to the
-unfused PyTorch baseline. Each program instance handles a (BLOCK_M × BLOCK_N)
-output tile and uses tl.dot (tensor cores) for the QKV projection.
+This module provides two Triton kernels and an adaptive dispatch function
+that together fuse the residual_add -> RMSNorm -> QKV_linear pipeline into
+a single GPU launch, eliminating two HBM round-trips.
 
-Grid: (ceil(M / BLOCK_M), ceil(3*H / BLOCK_N))
+Kernels:
+    1. _fused_rmsnorm_residual_qkv_kernel (2D grid, decode path)
+       Grid: (ceil(M/BLOCK_M), ceil(3H/BLOCK_N))
+       Used when M <= 32 to fill SMs via output-column parallelism.
 
-Strategy:
-  - Phase 1: Each program loads its (BLOCK_M, H) slice of hidden = x + r in
-    BLOCK_K-column chunks, accumulates sum-of-squares, computes rstd per row.
-  - Phase 2: Re-reads the same hidden slice (expected L1-resident for small
-    BLOCK_M) per K-tile, applies RMSNorm gain, then tl.dot with the
-    (BLOCK_K, BLOCK_N) weight tile to accumulate into the output.
+    2. _fused_rmsnorm_residual_qkv_persistent_kernel (1D grid, prefill path)
+       Grid: (ceil(M/BLOCK_M),)
+       Used when M > 32 to avoid redundant hidden-tile reads across N-tiles.
 
-HBM traffic analysis (per SM):
-  - x, r:      2 × BLOCK_M × H  (read twice; stays in L1 between passes)
-  - W:         BLOCK_N × H  (each program reads a unique row-stripe of W)
-  - rms_weight: H per program (read once per K-tile, BLOCK_K elems at a time)
-  - output:    BLOCK_M × BLOCK_N (written once)
+Public API:
+    fused_rmsnorm_residual_qkv(x, residual, rms_weight, qkv_weight, eps)
+        -> (Q, K, V)
+    get_autotune_best_config(M, H) -> dict | None
 
-Aggregated, W is read once total (different programs read disjoint row-stripes),
-and x/r re-reads are L1-cache hits for BLOCK_M × H ≤ L1 capacity (~128 KB).
+Algorithm (both kernels):
+    Phase 1 -- Variance accumulation:
+        For each BLOCK_K column chunk of hidden = x + r, accumulate
+        sum-of-squares in fp32. Compute rstd = 1/sqrt(var/H + eps).
 
-This avoids materializing the intermediate normalized tensor to HBM.
+    Phase 2 -- Fused normalize + matmul:
+        For each K-tile: re-read hidden (L1 cache hits), apply RMSNorm
+        gain, then tl.dot with weight tile -> fp32 accumulator.
 
-Phase 3: Tile sizes (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages) are
-selected per-shape by `@triton.autotune` keyed on (M, H). The config space
-spans decode-oriented tiles (small BLOCK_M for M ≤ 32) and prefill-oriented
-tiles (BLOCK_M up to 128 to amortize weight reads over more output rows).
+HBM traffic (theoretical minimum, per launch):
+    Reads:  (2*M*H + H + 3*H*H) * elem_bytes   # x, r, rms_weight, W
+    Writes: 3*M*H * elem_bytes                  # packed Q||K||V
+    The intermediate normalized tensor never touches HBM.
+
+Tile sizes are selected per-shape by @triton.autotune keyed on (M, H).
 """
 
 from __future__ import annotations
@@ -152,22 +157,26 @@ def _fused_rmsnorm_residual_qkv_kernel(
     BLOCK_K: tl.constexpr,
     IS_BF16: tl.constexpr,   # True → bfloat16 output, False → float16
 ):
-    pid_m = tl.program_id(0)   # row tile
-    pid_n = tl.program_id(1)   # output-column tile
+    # Each program computes one (BLOCK_M, BLOCK_N) output tile.
+    # pid_m selects the row tile, pid_n selects the output-column tile.
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
     m_start = pid_m * BLOCK_M
     n_start = pid_n * BLOCK_N
 
-    m_offs = m_start + tl.arange(0, BLOCK_M)   # (BLOCK_M,)
-    n_offs = n_start + tl.arange(0, BLOCK_N)   # (BLOCK_N,)
-    m_mask = m_offs < M
-    n_mask = n_offs < 3 * H
+    m_offs = m_start + tl.arange(0, BLOCK_M)   # (BLOCK_M,) row indices
+    n_offs = n_start + tl.arange(0, BLOCK_N)   # (BLOCK_N,) output-col indices
+    m_mask = m_offs < M       # guard against partial row tiles
+    n_mask = n_offs < 3 * H   # guard against partial column tiles
 
-    # ── Phase 1: residual add + RMSNorm (compute rstd) ──────────────────────
-    # Load hidden = x + r in BLOCK_K columns at a time, accumulate variance.
+    # ── Phase 1: Residual add + RMSNorm variance ────────────────────────────
+    # Accumulate sum-of-squares of hidden = x + r in fp32 to avoid overflow.
+    # This pass reads (BLOCK_M, H) of x and r -- the data will remain in L1
+    # for reuse in Phase 2 since BLOCK_M * H * 2 bytes fits within L1.
     var = tl.zeros([BLOCK_M], dtype=tl.float32)
     for k_start in range(0, H, BLOCK_K):
-        k_offs = k_start + tl.arange(0, BLOCK_K)   # (BLOCK_K,)
+        k_offs = k_start + tl.arange(0, BLOCK_K)
         k_mask = k_offs < H
 
         x_tile = tl.load(
@@ -179,23 +188,27 @@ def _fused_rmsnorm_residual_qkv_kernel(
             mask=m_mask[:, None] & k_mask[None, :], other=0.0,
         )  # (BLOCK_M, BLOCK_K)
 
-        h_tile_f32 = (x_tile + r_tile).to(tl.float32)  # (BLOCK_M, BLOCK_K)
+        # Fused residual add + cast to fp32 for numerically stable variance
+        h_tile_f32 = (x_tile + r_tile).to(tl.float32)
         var += tl.sum(h_tile_f32 * h_tile_f32, axis=1)   # (BLOCK_M,)
 
-    rstd = 1.0 / tl.sqrt(var / H + eps)   # (BLOCK_M,) fp32
+    # RMSNorm inverse standard deviation: rstd_i = 1 / sqrt(var_i / H + eps)
+    rstd = 1.0 / tl.sqrt(var / H + eps)   # (BLOCK_M,) in fp32
 
-    # ── Phase 2: QKV projection using tl.dot ────────────────────────────────
-    # For each K-tile:
+    # ── Phase 2: Fused normalize + QKV matmul via tl.dot ────────────────────
+    # For each K-tile, we compute:
     #   normed[m, k] = hidden[m, k] * rstd[m] * rms_weight[k]
     #   acc[m, n]   += normed[m, :] @ W[n, :]^T
-    # W is (3*H, H) row-major; we load W^T tile as (BLOCK_K, BLOCK_N).
+    #
+    # The re-read of x and r hits L1 cache (same addresses as Phase 1).
+    # W is (3*H, H) row-major; we load it transposed as (BLOCK_K, BLOCK_N).
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
     for k_start in range(0, H, BLOCK_K):
         k_offs = k_start + tl.arange(0, BLOCK_K)
         k_mask = k_offs < H
 
-        # Re-read hidden (BLOCK_M × BLOCK_K ≤ L1, so these are cache hits).
+        # Re-read hidden tile (L1 cache hits from Phase 1)
         x_tile = tl.load(
             X_ptr + m_offs[:, None] * stride_x_row + k_offs[None, :],
             mask=m_mask[:, None] & k_mask[None, :], other=0.0,
@@ -206,23 +219,25 @@ def _fused_rmsnorm_residual_qkv_kernel(
         )
         h_tile_f32 = (x_tile + r_tile).to(tl.float32)
 
+        # Apply RMSNorm: normed = hidden * rstd * gain, then cast back to
+        # input dtype (fp16/bf16) for tensor-core compatibility with tl.dot.
         w_rms = tl.load(RMSWeight_ptr + k_offs, mask=k_mask, other=0.0).to(tl.float32)
-        # normed in original dtype for tensor-core compatibility
         normed_tile = (h_tile_f32 * rstd[:, None] * w_rms[None, :]).to(x_tile.dtype)
-        # (BLOCK_M, BLOCK_K) in fp16/bf16
+        # normed_tile: (BLOCK_M, BLOCK_K) in fp16/bf16
 
-        # Weight tile W^T: shape (BLOCK_K, BLOCK_N)
-        # W[n, k] lives at QKVWeight_ptr + n*stride_w_row + k
-        # We want w_t[k_idx, n_idx] = W[n_offs[n_idx], k_offs[k_idx]]
+        # Load transposed weight tile: W_T[k, n] = W[n, k]
+        # Each pid_n reads a disjoint stripe of W, so W is read exactly once
+        # across the full grid.
         w_t = tl.load(
             QKVWeight_ptr + n_offs[None, :] * stride_w_row + k_offs[:, None],
             mask=k_mask[:, None] & n_mask[None, :], other=0.0,
         )  # (BLOCK_K, BLOCK_N) in fp16/bf16
 
-        # Tensor-core matmul: (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N) → fp32 acc
+        # Tensor-core matmul with fp32 accumulation to prevent precision loss
         acc = tl.dot(normed_tile, w_t, acc, out_dtype=tl.float32)
 
-    # ── Store output ─────────────────────────────────────────────────────────
+    # ── Store output tile ───────────────────────────────────────────────────
+    # Cast fp32 accumulator back to input dtype before writing to HBM
     out_cast = tl.bfloat16 if IS_BF16 else tl.float16
     out_ptrs = Out_ptr + m_offs[:, None] * stride_o_row + n_offs[None, :]
     tl.store(out_ptrs, acc.to(out_cast), mask=m_mask[:, None] & n_mask[None, :])
@@ -325,13 +340,20 @@ def _fused_rmsnorm_residual_qkv_persistent_kernel(
     BLOCK_K: tl.constexpr,
     IS_BF16: tl.constexpr,
 ):
+    # 1D grid: each program handles ALL output columns for its row tile.
+    # This eliminates the redundant hidden-tile reads that plague the 2D
+    # kernel at large M (where ceil(3H/BLOCK_N) sibling programs each
+    # independently re-read the same rows -- up to 19x read amplification).
     pid_m = tl.program_id(0)
 
     m_start = pid_m * BLOCK_M
     m_offs = m_start + tl.arange(0, BLOCK_M)
     m_mask = m_offs < M
 
-    # ── Phase 1: residual add + RMSNorm variance ───────────────────────────
+    # ── Phase 1: Residual add + RMSNorm variance ──────────────────────────
+    # Identical to the 2D kernel: accumulate sum-of-squares in fp32.
+    # The hidden data loaded here stays in L1/L2 for reuse across all
+    # N-tiles in Phase 2.
     var = tl.zeros([BLOCK_M], dtype=tl.float32)
     for k_start in range(0, H, BLOCK_K):
         k_offs = k_start + tl.arange(0, BLOCK_K)
@@ -351,9 +373,14 @@ def _fused_rmsnorm_residual_qkv_persistent_kernel(
 
     rstd = 1.0 / tl.sqrt(var / H + eps)
 
-    # ── Phase 2: persistent N-loop — QKV projection ───────────────────────
-    # Outer loop over output-column tiles; inner loop over K-reduction.
-    # hidden (x+r) is re-read per N-tile but expected L1/L2-resident.
+    # ── Phase 2: Persistent N-loop -- QKV projection ─────────────────────
+    # Outer loop iterates over output-column tiles (N dimension = 3H).
+    # Inner loop reduces over the K dimension (hidden dim H).
+    #
+    # Key insight: hidden (x+r) is re-read once per N-tile, but since
+    # Phase 1 already loaded it into L1/L2, these are cache hits. The
+    # weight matrix W is still read exactly once total (each N-tile
+    # reads a disjoint BLOCK_N-wide column stripe).
     for n_start in range(0, THREE_H, BLOCK_N):
         n_offs = n_start + tl.arange(0, BLOCK_N)
         n_mask = n_offs < THREE_H
@@ -364,7 +391,7 @@ def _fused_rmsnorm_residual_qkv_persistent_kernel(
             k_offs = k_start + tl.arange(0, BLOCK_K)
             k_mask = k_offs < H
 
-            # Re-read hidden (L1/L2 hits after Phase 1)
+            # Re-read hidden (L1/L2 cache hits from Phase 1)
             x_tile = tl.load(
                 X_ptr + m_offs[:, None] * stride_x_row + k_offs[None, :],
                 mask=m_mask[:, None] & k_mask[None, :], other=0.0,
@@ -375,18 +402,20 @@ def _fused_rmsnorm_residual_qkv_persistent_kernel(
             )
             h_tile_f32 = (x_tile + r_tile).to(tl.float32)
 
+            # RMSNorm: normalize + apply learnable gain
             w_rms = tl.load(RMSWeight_ptr + k_offs, mask=k_mask, other=0.0).to(tl.float32)
             normed_tile = (h_tile_f32 * rstd[:, None] * w_rms[None, :]).to(x_tile.dtype)
 
-            # Weight tile W^T: (BLOCK_K, BLOCK_N)
+            # Load transposed weight tile W_T[k, n] = W[n, k]
             w_t = tl.load(
                 QKVWeight_ptr + n_offs[None, :] * stride_w_row + k_offs[:, None],
                 mask=k_mask[:, None] & n_mask[None, :], other=0.0,
             )
 
+            # Tensor-core matmul with fp32 accumulation
             acc = tl.dot(normed_tile, w_t, acc, out_dtype=tl.float32)
 
-        # Store this N-tile
+        # Store this N-tile's output, cast back to input dtype
         out_cast = tl.bfloat16 if IS_BF16 else tl.float16
         out_ptrs = Out_ptr + m_offs[:, None] * stride_o_row + n_offs[None, :]
         tl.store(out_ptrs, acc.to(out_cast), mask=m_mask[:, None] & n_mask[None, :])
@@ -394,6 +423,12 @@ def _fused_rmsnorm_residual_qkv_persistent_kernel(
 
 # ---------------------------------------------------------------------------
 # Dispatch threshold: below this M, use 2D grid (decode); above, persistent.
+#
+# Rationale: At M <= 32, the persistent kernel launches only 1 program
+# (ceil(32/BLOCK_M) = 1 for BLOCK_M >= 32), leaving 79 of 80 SMs idle.
+# The 2D grid adds pid_n parallelism (ceil(3H/BLOCK_N) ~= 192 programs)
+# to fill SMs. Above M = 32, enough row tiles exist to keep SMs busy,
+# and the persistent kernel's better data reuse wins.
 # ---------------------------------------------------------------------------
 _PERSISTENT_THRESHOLD = 32
 
