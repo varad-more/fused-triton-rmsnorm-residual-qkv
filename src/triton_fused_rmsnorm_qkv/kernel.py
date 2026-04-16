@@ -228,6 +228,176 @@ def _fused_rmsnorm_residual_qkv_kernel(
     tl.store(out_ptrs, acc.to(out_cast), mask=m_mask[:, None] & n_mask[None, :])
 
 
+# ---------------------------------------------------------------------------
+# Persistent-in-N kernel (Phase 4)
+#
+# Grid: (ceil(M / BLOCK_M), 1) — each program handles ALL 3H output columns
+# for its BLOCK_M row tile. Hidden (x + r) is read from HBM once in Phase 1,
+# then reused from L1/L2 cache across all N-tiles in Phase 2. Weight W is
+# read exactly once across the full grid (each N-tile reads a disjoint stripe).
+# ---------------------------------------------------------------------------
+
+
+def _autotune_configs_persistent():
+    """Config space for the persistent-in-N kernel.
+
+    BLOCK_M ∈ {16, 32, 64, 128}  (includes 16 for transition regime)
+    BLOCK_N ∈ {64, 128, 256}
+    BLOCK_K ∈ {32, 64}
+    num_warps ∈ {4, 8}
+    num_stages ∈ {2, 3}
+    """
+    SHARED_MEM_BUDGET = 96 * 1024
+    BYTES_PER_HALF = 2
+
+    configs = []
+    for BM in (16, 32, 64, 128):
+        for BN in (64, 128, 256):
+            for BK in (32, 64):
+                for nw in (4, 8):
+                    for ns in (2, 3):
+                        # Register pressure: fp32 accumulator tiles
+                        if BM * BN > 128 * 256:
+                            continue
+                        # Large tiles need enough warps
+                        if BM * BN >= 128 * 128 and nw < 8:
+                            continue
+                        # Shared-memory for K-stage pipeline buffers
+                        bytes_per_stage = BYTES_PER_HALF * (BM * BK + BK * BN)
+                        if bytes_per_stage * ns > SHARED_MEM_BUDGET:
+                            continue
+                        configs.append(triton.Config(
+                            {"BLOCK_M": BM, "BLOCK_N": BN, "BLOCK_K": BK},
+                            num_warps=nw, num_stages=ns,
+                        ))
+    return configs
+
+
+def _prune_configs_persistent(configs, named_args, **kwargs):
+    """Per-shape pruning for persistent-in-N kernel."""
+    M = named_args["M"]
+
+    def keep(c):
+        BM = c.kwargs["BLOCK_M"]
+        BK = c.kwargs["BLOCK_K"]
+        # Upper bound: don't waste rows
+        if BM > max(16, 2 * M):
+            return False
+        # Lower bound for large M: small BLOCK_M means too many programs
+        if M >= 256 and BM < 32:
+            return False
+        if M >= 512 and BM == 32:
+            return False
+        # num_stages=3 only with smaller BLOCK_K
+        if c.num_stages == 3 and BK > 32:
+            return False
+        # For large M, num_warps=4 with big tiles under-fills SM
+        if M >= 1024 and c.num_warps == 4 and BM * c.kwargs["BLOCK_N"] >= 64 * 128:
+            return False
+        return True
+
+    pruned = [c for c in configs if keep(c)]
+    return pruned or configs
+
+
+@triton.autotune(
+    configs=_autotune_configs_persistent(),
+    key=["M", "H"],
+    prune_configs_by={"early_config_prune": _prune_configs_persistent},
+)
+@triton.jit
+def _fused_rmsnorm_residual_qkv_persistent_kernel(
+    X_ptr,
+    Residual_ptr,
+    RMSWeight_ptr,
+    QKVWeight_ptr,   # (3*H, H) row-major
+    Out_ptr,         # (M, 3*H)
+    M,
+    H: tl.constexpr,
+    THREE_H: tl.constexpr,  # = 3 * H, passed as constexpr for the N-loop bound
+    stride_x_row,
+    stride_r_row,
+    stride_w_row,
+    stride_o_row,
+    eps,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    IS_BF16: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+
+    m_start = pid_m * BLOCK_M
+    m_offs = m_start + tl.arange(0, BLOCK_M)
+    m_mask = m_offs < M
+
+    # ── Phase 1: residual add + RMSNorm variance ───────────────────────────
+    var = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for k_start in range(0, H, BLOCK_K):
+        k_offs = k_start + tl.arange(0, BLOCK_K)
+        k_mask = k_offs < H
+
+        x_tile = tl.load(
+            X_ptr + m_offs[:, None] * stride_x_row + k_offs[None, :],
+            mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+        )
+        r_tile = tl.load(
+            Residual_ptr + m_offs[:, None] * stride_r_row + k_offs[None, :],
+            mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+        )
+
+        h_tile_f32 = (x_tile + r_tile).to(tl.float32)
+        var += tl.sum(h_tile_f32 * h_tile_f32, axis=1)
+
+    rstd = 1.0 / tl.sqrt(var / H + eps)
+
+    # ── Phase 2: persistent N-loop — QKV projection ───────────────────────
+    # Outer loop over output-column tiles; inner loop over K-reduction.
+    # hidden (x+r) is re-read per N-tile but expected L1/L2-resident.
+    for n_start in range(0, THREE_H, BLOCK_N):
+        n_offs = n_start + tl.arange(0, BLOCK_N)
+        n_mask = n_offs < THREE_H
+
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+        for k_start in range(0, H, BLOCK_K):
+            k_offs = k_start + tl.arange(0, BLOCK_K)
+            k_mask = k_offs < H
+
+            # Re-read hidden (L1/L2 hits after Phase 1)
+            x_tile = tl.load(
+                X_ptr + m_offs[:, None] * stride_x_row + k_offs[None, :],
+                mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+            )
+            r_tile = tl.load(
+                Residual_ptr + m_offs[:, None] * stride_r_row + k_offs[None, :],
+                mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+            )
+            h_tile_f32 = (x_tile + r_tile).to(tl.float32)
+
+            w_rms = tl.load(RMSWeight_ptr + k_offs, mask=k_mask, other=0.0).to(tl.float32)
+            normed_tile = (h_tile_f32 * rstd[:, None] * w_rms[None, :]).to(x_tile.dtype)
+
+            # Weight tile W^T: (BLOCK_K, BLOCK_N)
+            w_t = tl.load(
+                QKVWeight_ptr + n_offs[None, :] * stride_w_row + k_offs[:, None],
+                mask=k_mask[:, None] & n_mask[None, :], other=0.0,
+            )
+
+            acc = tl.dot(normed_tile, w_t, acc, out_dtype=tl.float32)
+
+        # Store this N-tile
+        out_cast = tl.bfloat16 if IS_BF16 else tl.float16
+        out_ptrs = Out_ptr + m_offs[:, None] * stride_o_row + n_offs[None, :]
+        tl.store(out_ptrs, acc.to(out_cast), mask=m_mask[:, None] & n_mask[None, :])
+
+
+# ---------------------------------------------------------------------------
+# Dispatch threshold: below this M, use 2D grid (decode); above, persistent.
+# ---------------------------------------------------------------------------
+_PERSISTENT_THRESHOLD = 32
+
+
 def fused_rmsnorm_residual_qkv(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -237,8 +407,10 @@ def fused_rmsnorm_residual_qkv(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused residual add + RMSNorm + QKV projection.
 
-    Drop-in replacement for baseline.rmsnorm_residual_qkv. Tile sizes are
-    selected by `@triton.autotune` on first call for each (M, H) shape.
+    Drop-in replacement for baseline.rmsnorm_residual_qkv. Dispatches to:
+      - 2D grid kernel for decode (M ≤ 32): fills SMs via pid_n parallelism
+      - Persistent-in-N kernel for prefill (M > 32): reads hidden once, loops N
+    Tile sizes selected by `@triton.autotune` per (M, H) shape.
     """
     assert x.is_cuda, "Fused kernel requires CUDA tensors"
     B, S, H = x.shape
@@ -248,22 +420,35 @@ def fused_rmsnorm_residual_qkv(
     r_flat = residual.reshape(M, H)
     out = torch.empty(M, 3 * H, dtype=x.dtype, device=x.device)
 
-    # Grid is a lambda so autotune's selected BLOCK_M/BLOCK_N determine sizing.
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_M"]),
-        triton.cdiv(3 * H, META["BLOCK_N"]),
-    )
-
-    _fused_rmsnorm_residual_qkv_kernel[grid](
-        x_flat, r_flat, rms_weight, qkv_weight, out,
-        M, H,
-        x_flat.stride(0),
-        r_flat.stride(0),
-        qkv_weight.stride(0),
-        out.stride(0),
-        eps,
-        IS_BF16=(x.dtype == torch.bfloat16),
-    )
+    if M <= _PERSISTENT_THRESHOLD:
+        # Decode path: 2D grid fills SMs
+        grid = lambda META: (
+            triton.cdiv(M, META["BLOCK_M"]),
+            triton.cdiv(3 * H, META["BLOCK_N"]),
+        )
+        _fused_rmsnorm_residual_qkv_kernel[grid](
+            x_flat, r_flat, rms_weight, qkv_weight, out,
+            M, H,
+            x_flat.stride(0),
+            r_flat.stride(0),
+            qkv_weight.stride(0),
+            out.stride(0),
+            eps,
+            IS_BF16=(x.dtype == torch.bfloat16),
+        )
+    else:
+        # Prefill path: persistent-in-N, 1D grid
+        grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),)
+        _fused_rmsnorm_residual_qkv_persistent_kernel[grid](
+            x_flat, r_flat, rms_weight, qkv_weight, out,
+            M, H, 3 * H,
+            x_flat.stride(0),
+            r_flat.stride(0),
+            qkv_weight.stride(0),
+            out.stride(0),
+            eps,
+            IS_BF16=(x.dtype == torch.bfloat16),
+        )
 
     out = out.reshape(B, S, 3 * H)
     q, k, v = out.chunk(3, dim=-1)
@@ -273,18 +458,19 @@ def fused_rmsnorm_residual_qkv(
 def get_autotune_best_config(M: int, H: int) -> dict | None:
     """Return the autotune-selected config for a given (M, H), if cached.
 
-    Useful for roofline analysis and benchmark reporting. Returns None if
-    autotune has not yet run for this shape.
+    Checks the persistent kernel cache first (prefill path), then falls
+    back to the 2D kernel cache (decode path).
     """
-    cache = getattr(_fused_rmsnorm_residual_qkv_kernel, "cache", {})
-    # Triton's autotune cache key includes all constexpr args + the `key` list,
-    # so we can't look up by (M, H) alone. Instead, scan for a matching entry.
-    for k, cfg in cache.items():
-        # k is a tuple that includes M and H somewhere; match conservatively.
-        if M in k and H in k:
-            return {
-                **cfg.kwargs,
-                "num_warps": cfg.num_warps,
-                "num_stages": cfg.num_stages,
-            }
+    for kernel in (
+        _fused_rmsnorm_residual_qkv_persistent_kernel,
+        _fused_rmsnorm_residual_qkv_kernel,
+    ):
+        cache = getattr(kernel, "cache", {})
+        for k, cfg in cache.items():
+            if M in k and H in k:
+                return {
+                    **cfg.kwargs,
+                    "num_warps": cfg.num_warps,
+                    "num_stages": cfg.num_stages,
+                }
     return None

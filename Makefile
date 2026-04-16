@@ -1,13 +1,16 @@
+CONDA_ENV ?= triton-rmsnorm
+RUN = conda run -n $(CONDA_ENV) --no-banner
+
 .PHONY: install test benchmark clean
 
 install:
-	pip install -e ".[dev]"
+	$(RUN) pip install -e ".[dev]"
 
 test:
-	python -m pytest tests/ -v
+	$(RUN) python -m pytest tests/ -v
 
 benchmark:
-	python benchmarks/harness.py
+	$(RUN) python benchmarks/harness.py
 
 clean:
 	rm -rf build/ dist/ *.egg-info src/*.egg-info
