@@ -1,5 +1,12 @@
+# Set USE_CONDA=1 to wrap commands in `conda run -n $(CONDA_ENV)`.
+# Default is bare `python` so the Makefile works inside Docker and plain venvs.
 CONDA_ENV ?= triton-rmsnorm
+USE_CONDA ?= 0
+ifeq ($(USE_CONDA),1)
 RUN = conda run -n $(CONDA_ENV) --no-banner
+else
+RUN =
+endif
 
 .PHONY: install test benchmark clean
 

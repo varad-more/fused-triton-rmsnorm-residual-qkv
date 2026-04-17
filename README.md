@@ -4,7 +4,11 @@ A production-grade Triton kernel that fuses **residual add + RMSNorm + packed QK
 
 **Target hardware:** NVIDIA A10G (24 GB VRAM, 600 GB/s HBM, 125 TFLOPs fp16)
 
+**Headline (Llama-3-8B end-to-end, fp16, A10G):** +1.4% tok/s at B=1 and +2.4% tok/s at B=16 vs stock HuggingFace + cuBLAS. Peak memory −1.5 GB after the Phase-6 native-GQA refactor. 86/86 correctness tests pass; kernel-time decode MBU ~73%. Full results and honest analysis in [`docs/week4_e2e.md`](docs/week4_e2e.md).
+
 ## Motivation
+
+![Fused op memory flow](docs/assets/fused_op_flow.svg)
 
 In standard transformer inference the sequence `residual_add -> RMSNorm -> QKV_linear` issues three separate CUDA kernels, each paying a full round-trip to HBM:
 
@@ -31,6 +35,8 @@ This matters most at **decode time** (M = batch_size, S = 1) where the workload 
 | 2 | Fused Triton kernel (2D grid, forward pass) | done |
 | 3 | `@triton.autotune` sweep + MBU/MFU analysis + Nsight profiling | done |
 | 4 | Persistent-in-N kernel + adaptive dispatch | done |
+| 5 | End-to-end Llama-3-8B decode integration + `torch.compile` comparison | done |
+| 6 | Native GQA kernel (`N_OUT` + `HAS_RESIDUAL` constexpr) — beats HF baseline e2e | done |
 
 ## Repository Layout
 
@@ -42,15 +48,23 @@ src/triton_fused_rmsnorm_qkv/
 benchmarks/
     harness.py               # torch.utils.benchmark harness (prefill + decode grids)
     mbu_analysis.py          # MBU / MFU / arithmetic intensity analysis
+    e2e_decode.py            # end-to-end Llama-3-8B tok/s harness (Phase 5/6)
+    torch_compile_baseline.py# torch.compile(max-autotune) e2e comparison
     _postprocess_mfu.py      # CSV post-processor for MFU columns
-    results/                 # CSV outputs (baseline.csv, decode.csv, mbu.csv)
+    results/                 # CSV outputs (baseline.csv, decode.csv, mbu.csv, e2e_*.csv)
+integration/
+    llama3_patch.py          # monkey-patch Llama-3 decoder layers onto fused kernel
 tests/
-    test_correctness.py      # parametrized correctness suite (50 tests)
+    test_correctness.py      # parametrized correctness suite (86 tests)
 scripts/
     profile_ncu.sh           # Nsight Compute profiling script
     ncu/                     # ncu report outputs (.ncu-rep, .csv, .txt)
 docs/
     week3_profiling.md       # detailed Phase 3 profiling write-up
+    week4_e2e.md             # end-to-end decode results + honest analysis
+    assets/fused_op_flow.svg # memory-flow diagram (unfused vs fused)
+Dockerfile                   # reproducible A10G benchmark image
+CITATION.cff                 # citation metadata
 ```
 
 ## Quick Start
@@ -339,6 +353,61 @@ Kernel-time MBU (excluding ~20 us launch overhead): **~73%**, at the 70% target.
 | Decode (S=1) | **63.6-66.7%** | 0.3-5.0% | Bandwidth-bound; kernel-time MBU ~73% |
 | Prefill (S>=128) | 1.9-42.1% | **20.6-36.5%** | Compute-bound; MBU not meaningful |
 
+### End-to-End Llama-3-8B Decode (Phase 6 — native GQA)
+
+Drop-in integration: `integration/llama3_patch.py` monkey-patches every `LlamaDecoderLayer.forward` to route `input_layernorm + q_proj/k_proj/v_proj` through the fused kernel. Everything else (RoPE, KV cache, attention, `o_proj`, MLP) is unchanged. Phase 6 replaced the zero-padded `(3H, H)` packed weight with a native-GQA `(H + 2·H_kv, H)` = `(6144, 4096)` layout, and added a `HAS_RESIDUAL` constexpr to skip residual loads when Llama doesn't need them (residual-add happens *after* attention). The honest competitor is `torch.compile(mode='max-autotune-no-cudagraphs')` — plain `max-autotune` crashes inside HF `generate()`'s KV-cache update with a CUDAGraph overwrite error, a well-known HF/PyTorch integration gap.
+
+Workload: 32-layer Llama-3-8B (fp16, random weights — decode latency depends on shapes, not values), prompt=128, decode=256, greedy, `use_cache=True`, 2 warmup + median of 10 `generate()` runs. Prefill is timed separately and subtracted so `tok/s` is steady-state decode only.
+
+| config | batch | tok/s | latency (ms/tok) | peak mem (GB) |
+|--------|------:|------:|-----------------:|--------------:|
+| baseline (HF + cuBLAS) | 1 | 26.8 | 37.26 | 15.02 |
+| torch.compile (max-autotune-no-cudagraphs) | 1 | **31.2** | 32.02 | 15.07 |
+| fused (ours, autotune on) | 1 | **27.2** | 36.74 | 16.52 |
+| fused (ours, autotune off) | 1 | 25.3 | 39.55 | 16.52 |
+| baseline (HF + cuBLAS) | 16 | 379.6 | 42.15 | 15.76 |
+| torch.compile (max-autotune-no-cudagraphs) | 16 | 342.2 | 46.76 | 16.57 |
+| fused (ours, autotune on) | 16 | **388.7** | 41.17 | 17.26 |
+| fused (ours, autotune off) | 16 | 363.4 | 44.02 | 17.26 |
+
+**Speedup vs HF baseline**
+
+| | B=1 | B=16 |
+|---|---:|---:|
+| torch.compile | **+16.4%** | −9.9% |
+| fused (ours, autotune) | **+1.4%** | **+2.4%** |
+| fused (ours, no autotune) | −5.6% | −4.3% |
+
+**Autotune ablation:** autotune contributes **+7.5% (B=1)** and **+7.0% (B=16)** over a fixed Week-2 tile (BLOCK_M=32/64, BLOCK_N=128, BLOCK_K=32, warps=4, stages=2). The Week-3 tuning work carries through end-to-end.
+
+**Phase-5 → Phase-6 before/after:**
+
+| | B=1 | B=16 | peak mem |
+|---|---:|---:|---:|
+| Phase 5 (zero-padded 3H, H) | 24.5 tok/s | 353.9 tok/s | 18.0 → 18.8 GB |
+| Phase 6 (native GQA H + 2H_kv, H) | **27.2** | **388.7** | 16.5 → 17.3 GB |
+| Δ vs Phase 5 | +11.0% | +9.8% | −1.5 GB |
+| Δ vs HF baseline | −9% → **+1.4%** | −6% → **+2.4%** | — |
+
+**Where we win.** Over HF baseline at both batches (+1.4% B=1, +2.4% B=16) — cuBLAS is very good, but one fused launch per layer amortizes the three-launch overhead for q/k/v_proj. Over `torch.compile` at B=16 (+13.6%): Inductor pays per-kernel dispatch overhead in `no-cudagraphs` mode; our single fused launch avoids it.
+
+**Where we lose.** To `torch.compile` at B=1 (−12.8%). Inductor's RMSNorm+matmul fusion plus a generated decode-specialized kernel beats us in the single-sequence regime. This is the honest comparison — a modern `torch.compile(mode='max-autotune')` is a tough baseline for hand-written kernels on shapes it knows how to fuse.
+
+See [`docs/week4_e2e.md`](docs/week4_e2e.md) for the full Phase-6 write-up including the before/after refactor accounting.
+
+**Reproduce:**
+
+```bash
+PYTHONPATH=.:benchmarks python benchmarks/e2e_decode.py \
+    --batches 1 16 --prompt-len 128 --decode-len 256 --num-repeat 10
+
+PYTHONPATH=.:benchmarks python benchmarks/torch_compile_baseline.py \
+    --batches 1 16 --prompt-len 128 --decode-len 256 --num-repeat 10 \
+    --compile-mode max-autotune-no-cudagraphs
+```
+
+Raw CSVs: [`benchmarks/results/e2e_decode.csv`](benchmarks/results/e2e_decode.csv), [`benchmarks/results/e2e_decode_torch_compile.csv`](benchmarks/results/e2e_decode_torch_compile.csv).
+
 ## Correctness Verification
 
 **50/50 tests passed** (CUDA, Python 3.13, PyTorch 2.11, Triton 3.6, A10G)
@@ -429,6 +498,19 @@ pip install torch==2.11.0 triton==3.6.0
 pip install -e ".[dev]"
 ```
 
+### Docker (reproducible environment)
+
+The pinned stack (PyTorch 2.11, Triton 3.6, Transformers 5.5.4, CUDA 13.1, Python 3.13) is captured in the top-level `Dockerfile`:
+
+```bash
+docker build -t fused-triton-rmsnorm-qkv .
+docker run --rm --gpus all \
+    -v "$PWD/benchmarks/results:/app/benchmarks/results" \
+    fused-triton-rmsnorm-qkv make benchmark
+```
+
+Requires `--gpus all` and ≥22 GB VRAM for the full end-to-end Llama-3-8B grid.
+
 ### Full Reproduction
 
 ```bash
@@ -451,7 +533,8 @@ sudo bash scripts/profile_ncu.sh
 ### Expected Outputs
 
 After running the full benchmark, you should see:
-- **Decode speedup**: 0.92x - 1.12x (mean ~0.97x)
+- **End-to-end Llama-3-8B decode (Phase 6, native GQA):** +1.4% tok/s at B=1, +2.4% tok/s at B=16 vs stock HF + cuBLAS; peak memory −1.5 GB
+- **Microbench decode speedup**: 0.92x - 1.12x (mean ~0.97x, MHA shapes)
 - **Decode bandwidth**: 381-399 GB/s (63-67% MBU)
 - **Prefill speedup**: 0.10x - 0.75x (compute-bound, expected)
 
@@ -474,6 +557,20 @@ export TRITON_CACHE_DIR=~/.triton/cache
 - **Bandwidth:** `total_theoretical_bytes / median_time` (assumes each tensor read/written once from HBM)
 - **MBU:** `achieved_bandwidth / 600 GB/s` (A10G peak HBM2 bandwidth)
 - **MFU:** `achieved_TFLOPs / 125 TFLOPs` (A10G fp16 tensor-core peak)
+
+## Citation
+
+If you use this work, please cite it via the metadata in [`CITATION.cff`](CITATION.cff):
+
+```bibtex
+@software{more_fused_triton_rmsnorm_qkv_2026,
+  author  = {More, Varad},
+  title   = {Fused Triton Kernel: RMSNorm + Residual + QKV Projection},
+  year    = {2026},
+  version = {0.6.0},
+  url     = {https://github.com/varad-more/fused-triton-rmsnorm-residual-qkv}
+}
+```
 
 ## License
 

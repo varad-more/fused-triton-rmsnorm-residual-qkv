@@ -11,7 +11,10 @@ from triton_fused_rmsnorm_qkv.baseline import rmsnorm_residual_qkv
 
 _has_cuda = torch.cuda.is_available()
 if _has_cuda:
-    from triton_fused_rmsnorm_qkv.kernel import fused_rmsnorm_residual_qkv
+    from triton_fused_rmsnorm_qkv.kernel import (
+        fused_rmsnorm_residual_matmul,
+        fused_rmsnorm_residual_qkv,
+    )
 
 # ---------------------------------------------------------------------------
 # Reference implementation (manual, for cross-checking the baseline)
@@ -240,3 +243,104 @@ class TestFusedKernelCorrectness:
         assert not torch.isnan(q).any()
         assert not torch.isnan(k).any()
         assert not torch.isnan(v).any()
+
+
+# Phase 6: native GQA shapes + residual=None.
+#
+# GQA_SHAPES cover real production widths:
+#   Llama-3-8B: H=4096, H_kv=1024 -> N_OUT=6144
+#   Llama-3-70B slice: H=1024, H_kv=128 -> N_OUT=1280 (scaled for test time)
+#   Mistral-7B: H=4096, H_kv=1024 (same as Llama-3-8B)
+#   Qwen2-7B: H=3584, H_kv=512 -> N_OUT=4608
+GQA_SHAPES = [
+    # (B, S, H, H_kv) — S chosen to hit both 2D (M<=32) and persistent paths
+    (1,   1,  512,  128),   # decode, small
+    (1,  16,  512,  128),   # decode boundary
+    (1, 128, 1024,  256),   # persistent
+    (2, 256, 1024,  256),   # persistent, larger M
+    (1,   1, 4096, 1024),   # Llama-3-8B decode scale
+    (1,  32, 3584,  512),   # Qwen2-7B boundary
+]
+
+
+@pytest.mark.skipif(not _has_cuda, reason="CUDA not available")
+class TestGQAAndNoneResidual:
+    """Phase 6: native GQA widths + residual=None path."""
+
+    @pytest.fixture(
+        params=GQA_SHAPES,
+        ids=lambda s: f"B{s[0]}_S{s[1]}_H{s[2]}_Hkv{s[3]}",
+    )
+    def gqa_shape(self, request):
+        return request.param
+
+    @pytest.fixture(params=[torch.float16, torch.bfloat16], ids=lambda d: str(d).split(".")[-1])
+    def dtype(self, request):
+        return request.param
+
+    def _reference(self, x, residual, rms_weight, weight, eps):
+        """Manual reference for arbitrary-width matmul with optional residual."""
+        hidden = x.float() if residual is None else (x + residual).float()
+        var = hidden.pow(2).mean(dim=-1, keepdim=True)
+        normed = hidden * torch.rsqrt(var + eps)
+        normed = (normed * rms_weight.float()).to(x.dtype)
+        return torch.nn.functional.linear(normed, weight)
+
+    def test_gqa_matches_reference(self, gqa_shape, dtype):
+        B, S, H, H_kv = gqa_shape
+        torch.manual_seed(7)
+        device = "cuda"
+        N_OUT = H + 2 * H_kv
+
+        x = torch.randn(B, S, H, dtype=dtype, device=device)
+        residual = torch.randn(B, S, H, dtype=dtype, device=device)
+        rms_weight = torch.randn(H, dtype=dtype, device=device)
+        weight = torch.randn(N_OUT, H, dtype=dtype, device=device) * 0.02
+        eps = 1e-5
+
+        out_fused = fused_rmsnorm_residual_matmul(x, residual, rms_weight, weight, eps)
+        out_ref = self._reference(x, residual, rms_weight, weight, eps)
+
+        assert out_fused.shape == (B, S, N_OUT)
+        scale = (H / 512) ** 0.5
+        atol = (2e-1 if dtype == torch.bfloat16 else 5e-2) * scale
+        torch.testing.assert_close(out_fused, out_ref, atol=atol, rtol=1e-1)
+
+    def test_none_residual_matches_reference(self, gqa_shape, dtype):
+        B, S, H, H_kv = gqa_shape
+        torch.manual_seed(11)
+        device = "cuda"
+        N_OUT = H + 2 * H_kv
+
+        x = torch.randn(B, S, H, dtype=dtype, device=device)
+        rms_weight = torch.randn(H, dtype=dtype, device=device)
+        weight = torch.randn(N_OUT, H, dtype=dtype, device=device) * 0.02
+        eps = 1e-5
+
+        out_fused = fused_rmsnorm_residual_matmul(x, None, rms_weight, weight, eps)
+        out_ref = self._reference(x, None, rms_weight, weight, eps)
+
+        scale = (H / 512) ** 0.5
+        atol = (2e-1 if dtype == torch.bfloat16 else 5e-2) * scale
+        torch.testing.assert_close(out_fused, out_ref, atol=atol, rtol=1e-1)
+
+    def test_gqa_split_widths(self, gqa_shape, dtype):
+        """Verify slicing the (H + 2*H_kv) output gives correct Q, K, V widths."""
+        B, S, H, H_kv = gqa_shape
+        torch.manual_seed(0)
+        device = "cuda"
+        N_OUT = H + 2 * H_kv
+
+        x = torch.randn(B, S, H, dtype=dtype, device=device)
+        rms_weight = torch.ones(H, dtype=dtype, device=device)
+        weight = torch.randn(N_OUT, H, dtype=dtype, device=device) * 0.02
+
+        out = fused_rmsnorm_residual_matmul(x, None, rms_weight, weight)
+        q = out[..., :H]
+        k = out[..., H : H + H_kv]
+        v = out[..., H + H_kv : H + 2 * H_kv]
+
+        assert q.shape == (B, S, H)
+        assert k.shape == (B, S, H_kv)
+        assert v.shape == (B, S, H_kv)
+        assert not torch.isnan(out).any()

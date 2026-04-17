@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+title: "Fused Triton Kernel: RMSNorm + Residual + QKV Projection"
+message: "If you use this work, please cite it using the metadata below."
+type: software
+authors:
+  - given-names: Varad
+    family-names: More
+    email: vmore4@asu.edu
+repository-code: "https://github.com/varad-more/fused-triton-rmsnorm-residual-qkv"
+abstract: >-
+  A production-grade Triton kernel that fuses residual add + RMSNorm + packed
+  QKV projection into a single GPU launch, targeting decoder-only transformer
+  inference. Includes MBU/MFU analysis, Nsight Compute profiling, end-to-end
+  Llama-3-8B decode integration, and a rigorous torch.compile comparison.
+  Native-GQA layout (H + 2*H_kv, H) with HAS_RESIDUAL constexpr.
+keywords:
+  - triton
+  - gpu
+  - cuda
+  - transformers
+  - llama
+  - rmsnorm
+  - fused-kernel
+  - inference
+  - memory-bandwidth
+  - a10g
+license: MIT
+version: "0.6.0"
+date-released: "2026-04-17"
