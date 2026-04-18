@@ -80,7 +80,7 @@ CITATION.cff                 # citation metadata
 
 ```bash
 # Clone and install in development mode
-git clone <repo-url>
+git clone https://github.com/varad-more/fused-triton-rmsnorm-residual-qkv.git
 cd fused-triton-rmsnorm-residual-qkv
 pip install -e ".[dev]"
 ```
@@ -91,7 +91,7 @@ pip install -e ".[dev]"
 # Full test suite (CPU baseline + CUDA fused kernel)
 python -m pytest tests/ -v
 
-# Expected output: 50 passed
+# Expected output: 86 passed  (20 CPU + 66 CUDA; CUDA tests auto-skip without a GPU)
 ```
 
 ### Run Benchmarks
@@ -410,22 +410,26 @@ Raw CSVs: [`benchmarks/results/e2e_decode.csv`](benchmarks/results/e2e_decode.cs
 
 ## Correctness Verification
 
-**50/50 tests passed** (CUDA, Python 3.13, PyTorch 2.11, Triton 3.6, A10G)
+**86/86 tests passed** (CUDA, Python 3.13, PyTorch 2.11, Triton 3.6, A10G)
 
 ```
-tests/test_correctness.py  50 passed in 268.44s
+tests/test_correctness.py  86 passed
 
-  TestBaselineCorrectness
-    test_matches_manual_reference   8/8 passed   (fp16 + bf16 x 4 shapes)
-    test_output_shapes              8/8 passed
-    test_output_dtype_preserved     2/2 passed   (fp16 + bf16)
-  TestEdgeCases
-    test_zero_residual              1/1 passed
-    test_unit_weight                1/1 passed
-  TestFusedKernelCorrectness
-    test_matches_baseline          10/10 passed  (fp16 + bf16 x 5 CUDA shapes)
-    test_output_shapes             10/10 passed
-    test_no_nans                   10/10 passed
+  TestBaselineCorrectness                                  (CPU)
+    test_matches_manual_reference   8/8   passed   (fp16 + bf16 x 4 shapes)
+    test_output_shapes              8/8   passed
+    test_output_dtype_preserved     2/2   passed   (fp16 + bf16)
+  TestEdgeCases                                            (CPU)
+    test_zero_residual              1/1   passed
+    test_unit_weight                1/1   passed
+  TestFusedKernelCorrectness                               (CUDA)
+    test_matches_baseline           10/10 passed   (fp16 + bf16 x 5 CUDA shapes)
+    test_output_shapes              10/10 passed
+    test_no_nans                    10/10 passed
+  TestGQAAndNoneResidual (Phase 6)                         (CUDA)
+    test_gqa_matches_reference           12/12 passed  (fp16 + bf16 x 6 GQA shapes)
+    test_none_residual_matches_reference 12/12 passed
+    test_gqa_split_widths                12/12 passed
 ```
 
 ### Test Shapes (CUDA)

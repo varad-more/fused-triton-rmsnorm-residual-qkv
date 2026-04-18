@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  cpu-tests:
+    name: CPU-only smoke tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # Install the CPU wheel of PyTorch explicitly so we don't pull the CUDA
+      # variant. Triton installs fine on Linux x86 without a GPU — it can't
+      # JIT-compile kernels at runtime, but the CUDA tests are gated by
+      # `torch.cuda.is_available()` and auto-skip.
+      - name: Install CPU PyTorch + project
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.4"
+          pip install "triton>=3.0" numpy pandas pytest pytest-xdist
+          pip install --no-deps -e .
+
+      - name: Import smoke test
+        run: python -c "from triton_fused_rmsnorm_qkv import rmsnorm_residual_qkv; print('ok')"
+
+      - name: Run CPU tests
+        run: python -m pytest tests/ -v -k "Baseline or EdgeCases"
