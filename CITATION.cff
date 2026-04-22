@@ -8,11 +8,14 @@ authors:
     email: vmore4@asu.edu
 repository-code: "https://github.com/varad-more/fused-triton-rmsnorm-residual-qkv"
 abstract: >-
-  A production-grade Triton kernel that fuses residual add + RMSNorm + packed
-  QKV projection into a single GPU launch, targeting decoder-only transformer
-  inference. Includes MBU/MFU analysis, Nsight Compute profiling, end-to-end
-  Llama-3-8B decode integration, and a rigorous torch.compile comparison.
-  Native-GQA layout (H + 2*H_kv, H) with HAS_RESIDUAL constexpr.
+  A hand-written Triton kernel that fuses residual add + RMSNorm + packed
+  QKV projection into a single GPU launch, targeting the HBM-bound critical
+  path of decoder-only transformer inference. Includes MBU/MFU analysis,
+  Nsight Compute profiling, end-to-end Llama-3-8B decode integration on
+  AWS A10G, and a rigorous torch.compile(max-autotune-no-cudagraphs)
+  comparison. Native-GQA layout (H + 2*H_kv, H) with HAS_RESIDUAL constexpr.
+  Inference-only; portfolio / kernel-engineering study, not a production
+  inference runtime.
 keywords:
   - triton
   - gpu

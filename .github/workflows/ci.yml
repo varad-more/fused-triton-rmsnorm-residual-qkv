@@ -34,6 +34,10 @@ jobs:
           pip install "triton>=3.0" numpy pandas pytest pytest-xdist
           pip install --no-deps -e .
 
+      - name: Syntax check (py_compile all .py)
+        run: |
+          python -m compileall -q src benchmarks integration tests scripts
+
       - name: Import smoke test
         run: python -c "from triton_fused_rmsnorm_qkv import rmsnorm_residual_qkv; print('ok')"
 

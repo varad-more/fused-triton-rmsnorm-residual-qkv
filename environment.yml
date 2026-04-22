@@ -1,0 +1,30 @@
+# Conda environment used to produce the numbers in docs/week4_e2e.md.
+# Mirrors the Dockerfile pins (PyTorch 2.11, Triton 3.6, Transformers 5.5.4,
+# Python 3.13) so local conda installs and the Docker image match.
+#
+# Create:
+#   conda env create -f environment.yml
+#   conda activate triton-rmsnorm
+#   pip install -e ".[dev]"
+#
+# Update in place:
+#   conda env update -f environment.yml --prune
+#
+# Note: torch/triton are installed via pip rather than the conda pytorch
+# channel — CUDA 13.1 wheels are only available upstream, and Triton's
+# conda-forge builds lag the upstream pip wheels.
+name: triton-rmsnorm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - pip
+  - pip:
+      - torch==2.11.0
+      - triton==3.6.0
+      - transformers==5.5.4
+      - numpy>=1.26
+      - pandas>=2.1
+      - matplotlib>=3.8
+      - pytest>=8.0
+      - pytest-xdist>=3.5

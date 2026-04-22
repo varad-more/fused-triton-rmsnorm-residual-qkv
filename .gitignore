@@ -5,8 +5,23 @@ __pycache__/
 .venv/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 build/
 dist/
 *.egg-info/
-benchmarks/results/*.csv
 .ipynb_checkpoints/
+.DS_Store
+
+# Local tooling / editor state — never commit
+.claude/
+.idea/
+.vscode/
+*.swp
+
+# Local fresh benchmark runs overwrite the committed references. Use
+# `git add -f` only when updating the reference results intentionally.
+benchmarks/results/*.csv
+!benchmarks/results/baseline.csv
+!benchmarks/results/decode.csv
+!benchmarks/results/e2e_decode.csv
+!benchmarks/results/e2e_decode_torch_compile.csv

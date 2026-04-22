@@ -1,10 +1,32 @@
-# Fused RMSNorm + Residual + QKV Projection -- Triton Kernel
+# Fused RMSNorm + Residual + QKV Projection — Triton Kernel
 
-A production-grade Triton kernel that fuses **residual add + RMSNorm + packed QKV projection** into a single GPU launch, targeting the critical path in decoder-only transformer inference (Llama-3-8B, Mistral-7B, Qwen2-7B).
+[![ci](https://github.com/varad-more/fused-triton-rmsnorm-residual-qkv/actions/workflows/ci.yml/badge.svg)](https://github.com/varad-more/fused-triton-rmsnorm-residual-qkv/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 
-**Target hardware:** NVIDIA A10G (24 GB VRAM, 600 GB/s HBM, 125 TFLOPs fp16)
+A hand-written Triton kernel that fuses **residual add → RMSNorm → packed QKV projection** into a single GPU launch, targeting the HBM-bound critical path of decoder-only transformer inference (Llama-3-8B, Mistral-7B, Qwen2-7B).
 
-**Headline (Llama-3-8B end-to-end, fp16, A10G):** +1.4% tok/s at B=1 and +2.4% tok/s at B=16 vs stock HuggingFace + cuBLAS. Peak memory −1.5 GB after the Phase-6 native-GQA refactor. 86/86 correctness tests pass; kernel-time decode MBU ~73%. Full results and honest analysis in [`docs/week4_e2e.md`](docs/week4_e2e.md).
+## TL;DR
+
+- **What:** One Triton kernel replaces three stock launches (`add + rmsnorm + q/k/v_proj`) at the top of every transformer layer, with a native-GQA `(H + 2·H_kv, H)` output layout (no zero-padding).
+- **Why:** At decode time the QKV block is bandwidth-bound. Fusing lets the normalized hidden state stay in registers and L1 — two HBM round-trips vanish.
+- **Headline (Llama-3-8B end-to-end, fp16, A10G):** **+1.4% tok/s at B=1**, **+2.4% tok/s at B=16** vs stock HuggingFace + cuBLAS; **peak memory −1.5 GB** after the Phase-6 native-GQA refactor.
+- **Rigor:** **86/86 correctness tests pass** against both a pure-Python manual reference and the PyTorch baseline. Kernel-time decode MBU ≈ 73 %. Benchmarks include a `torch.compile(max-autotune-no-cudagraphs)` comparison and a Nsight Compute profile.
+- **Target hardware:** NVIDIA A10G (24 GB, 600 GB/s HBM, 125 TFLOPs fp16). Other Ampere/Ada cards should work; autotune will re-warm.
+
+Full write-up and honest wins/losses analysis: [`docs/week4_e2e.md`](docs/week4_e2e.md). Profiling deep-dive: [`docs/week3_profiling.md`](docs/week3_profiling.md).
+
+## Status & Scope
+
+This is a **kernel-engineering portfolio project**, not a production inference runtime. Concretely:
+
+- **Inference-only.** No backward pass, so this cannot be used for training or fine-tuning.
+- **One GPU class validated.** Tuned and profiled on A10G (sm_86). Other GPUs should work but autotune caches need to re-warm; tile picks may differ.
+- **Integration is a monkey-patch.** `integration/llama3_patch.py` rewrites `LlamaDecoderLayer.forward` at import time and is pinned to Transformers 5.5.4. Real deployments would want a proper `nn.Module` subclass or a vLLM/SGLang plugin.
+- **`torch.compile` beats us at B=1.** Inductor's auto-fusion of RMSNorm+matmul produces a decode-specialized kernel that wins by ~13 % at B=1 on the shapes it recognizes. Our hand-written kernel pulls ahead at B≥16. See the full speedup matrix below — the comparison is kept honest.
+- **No quantization, no tensor-parallel, no paged KV.** This is the top-of-layer fused op in isolation.
+
+If you want a copy-pasteable kernel to study, a reference Triton GEMM+norm fusion, or a honest engineering write-up — that's what this repo is for.
 
 ## Motivation
 
@@ -79,10 +101,29 @@ CITATION.cff                 # citation metadata
 ### Installation
 
 ```bash
-# Clone and install in development mode
 git clone https://github.com/varad-more/fused-triton-rmsnorm-residual-qkv.git
 cd fused-triton-rmsnorm-residual-qkv
+```
+
+**Option A — conda (recommended, matches the environment used for the reported numbers):**
+
+```bash
+conda env create -f environment.yml   # creates env `triton-rmsnorm`
+conda activate triton-rmsnorm
 pip install -e ".[dev]"
+```
+
+**Option B — plain pip:**
+
+```bash
+pip install -e ".[dev]"
+```
+
+**Option C — Docker (fully pinned, reproducible):**
+
+```bash
+docker build -t fused-triton-rmsnorm-qkv .
+docker run --rm --gpus all fused-triton-rmsnorm-qkv make test
 ```
 
 ### Run Correctness Tests
@@ -317,6 +358,8 @@ All measurements: NVIDIA A10G (g5.2xlarge), fp16, PyTorch 2.11, Triton 3.6, Pyth
 
 The decode regime is the target use case: single new token per request, M = batch_size.
 
+> **How to read this table.** These numbers are the **kernel in isolation**, measured on the classic MHA shape (packed `(3H, H)` matmul). They show the fused kernel lands at parity with cuBLAS on this shape (~0.97× mean). The end-to-end win reported above (+1.4–2.4% tok/s on Llama-3-8B) comes from the Phase-6 **native-GQA** kernel with `N_OUT = H + 2·H_kv` and `HAS_RESIDUAL=False` — that kernel is not benchmarked here because MHA (`N_OUT = 3H`) is the apples-to-apples comparison against cuBLAS. See the [End-to-End section](#end-to-end-llama-3-8b-decode-phase-6--native-gqa) below for the GQA numbers.
+
 | Model | Batch | Baseline (us) | Fused (us) | Speedup | Fused BW (GB/s) | MBU % |
 |-------|------:|--------------:|-----------:|--------:|----------------:|------:|
 | Llama-3-8B | 1 | 242.7 | 252.4 | 0.96x | 399.0 | 66.5 |
@@ -353,6 +396,7 @@ Kernel-time MBU (excluding ~20 us launch overhead): **~73%**, at the 70% target.
 | Decode (S=1) | **63.6-66.7%** | 0.3-5.0% | Bandwidth-bound; kernel-time MBU ~73% |
 | Prefill (S>=128) | 1.9-42.1% | **20.6-36.5%** | Compute-bound; MBU not meaningful |
 
+<a id="end-to-end-llama-3-8b-decode-phase-6--native-gqa"></a>
 ### End-to-End Llama-3-8B Decode (Phase 6 — native GQA)
 
 Drop-in integration: `integration/llama3_patch.py` monkey-patches every `LlamaDecoderLayer.forward` to route `input_layernorm + q_proj/k_proj/v_proj` through the fused kernel. Everything else (RoPE, KV cache, attention, `o_proj`, MLP) is unchanged. Phase 6 replaced the zero-padded `(3H, H)` packed weight with a native-GQA `(H + 2·H_kv, H)` = `(6144, 4096)` layout, and added a `HAS_RESIDUAL` constexpr to skip residual loads when Llama doesn't need them (residual-add happens *after* attention). The honest competitor is `torch.compile(mode='max-autotune-no-cudagraphs')` — plain `max-autotune` crashes inside HF `generate()`'s KV-cache update with a CUDAGraph overwrite error, a well-known HF/PyTorch integration gap.
@@ -576,6 +620,10 @@ If you use this work, please cite it via the metadata in [`CITATION.cff`](CITATI
 }
 ```
 
+## Feedback & Contributions
+
+Questions, reproduction issues, or ideas for where this kernel should go next (H100 tuning, fp8, backward pass, vLLM integration) are welcome — open a [GitHub issue](https://github.com/varad-more/fused-triton-rmsnorm-residual-qkv/issues) or reach out via the email in [`CITATION.cff`](CITATION.cff). Numbers here are honest and reproducible; if you can't reproduce them on an A10G, that's a bug worth filing.
+
 ## License
 
-MIT
+MIT — see [`LICENSE`](LICENSE).
